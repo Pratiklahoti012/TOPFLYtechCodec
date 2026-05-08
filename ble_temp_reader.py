@@ -9,6 +9,7 @@ message layout used in the repo codec:
 
 import argparse
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
@@ -94,26 +95,51 @@ def parse_topflytech_temp_payload(payload: bytes) -> Iterable[TempReading]:
     return out
 
 
+def normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Read nearby TOPFLYtech BLE temperature")
     parser.add_argument("--name", help="Filter by BLE local-name substring (example: T-Sense)")
     parser.add_argument("--mac", help="Filter by advertiser MAC address")
     parser.add_argument("--timeout", type=float, default=0.0, help="Run seconds; 0 = forever")
+    parser.add_argument(
+        "--show-devices",
+        action="store_true",
+        help="Print discovered advertisers (debug name filtering)",
+    )
     args = parser.parse_args()
 
     target_mac = args.mac.upper() if args.mac else None
-    name_filter = args.name.lower() if args.name else None
+    name_filter = normalize_name(args.name) if args.name else None
 
     last_by_sensor: dict[str, TempReading] = {}
+    seen_advertisers: set[str] = set()
+    matched_any_advertiser = False
     print("Scanning BLE advertisements... Ctrl+C to stop")
 
     def callback(device, adv):
+        nonlocal matched_any_advertiser
         if target_mac and device.address.upper() != target_mac:
             return
+
+        adv_names = [
+            device.name or "",
+            adv.local_name or "",
+            (adv.platform_data[1].get("Name") if isinstance(adv.platform_data, tuple) and len(adv.platform_data) > 1 and isinstance(adv.platform_data[1], dict) else "") or "",
+        ]
+
+        if args.show_devices and device.address not in seen_advertisers:
+            seen_advertisers.add(device.address)
+            pretty_names = ", ".join([n for n in adv_names if n]) or "<no-name>"
+            print(f"[DISCOVERED] dev={device.address} names={pretty_names}")
+
         if name_filter:
-            name = (device.name or adv.local_name or "").lower()
-            if name_filter not in name:
+            normalized_names = [normalize_name(n) for n in adv_names if n]
+            if not any(name_filter in n for n in normalized_names):
                 return
+        matched_any_advertiser = True
 
         for payload in adv.manufacturer_data.values():
             for reading in parse_topflytech_temp_payload(payload):
@@ -137,6 +163,11 @@ async def main() -> None:
                 await asyncio.sleep(1)
     finally:
         await scanner.stop()
+        if name_filter and not matched_any_advertiser:
+            print(
+                "No advertisers matched --name filter. Try --show-devices to inspect BLE names, "
+                "or use --mac <AA:BB:CC:DD:EE:FF>."
+            )
 
 
 if __name__ == "__main__":
