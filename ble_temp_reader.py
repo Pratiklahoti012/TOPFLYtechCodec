@@ -1,113 +1,133 @@
 #!/usr/bin/env python3
 """
-Read temperature from a nearby TOPFLYtech BLE temperature sensor using BLE advertisements.
+Read temperature from a nearby TOPFLYtech BLE temperature sensor.
 
-This script scans BLE advertisements, decodes manufacturer data blocks in the same format
-used by TOPFLYtech codec libraries, and prints temperature updates.
-
-Requirements:
-  pip install bleak
-
-Usage:
-  python ble_temp_reader.py --name T-Sense
-  python ble_temp_reader.py --mac AA:BB:CC:DD:EE:FF
+This scanner decodes manufacturer-data payloads that match TOPFLYtech's BLE temp
+message layout used in the repo codec:
+  [0x00, 0x04] + N * 15-byte temp blocks
 """
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Iterable
 
 from bleak import BleakScanner
+
+
+@dataclass(frozen=True)
+class TempReading:
+    sensor_mac: str
+    temperature_c: float
+    humidity_pct: float
+    battery_pct: int
+    voltage_v: float
 
 
 def bytes_to_short(data: bytes, offset: int) -> int:
     return ((data[offset] & 0xFF) << 8) | (data[offset + 1] & 0xFF)
 
 
-def decode_ble_temp_block(block: bytes):
-    """
-    Decode one BLE temp payload block using the structure from Topflytech codec
-    getBleTempData (mac[6], voltage[1], battery[1], temp[2], humidity[2], light[2], rssi[1]).
-    """
-    if len(block) < 15:
+def decode_temp_block(block: bytes) -> TempReading | None:
+    if len(block) != 15:
         return None
 
     mac = block[0:6].hex().upper()
     if mac.startswith("0000"):
         mac = mac[4:12]
 
-    voltage_tmp = block[6]
-    voltage = -999 if voltage_tmp == 255 else 2 + 0.01 * voltage_tmp
+    voltage_raw = block[6]
+    voltage = -999.0 if voltage_raw == 255 else 2 + 0.01 * voltage_raw
 
-    battery_tmp = block[7]
-    battery = -999 if battery_tmp == 255 else battery_tmp
+    battery = -999 if block[7] == 255 else block[7]
 
-    temperature_raw = bytes_to_short(block, 8)
-    if temperature_raw == 0xFFFF:
-        temperature = -999
+    # Match repo's Python codec implementation exactly.
+    temp_raw = bytes_to_short(block, 8)
+    if temp_raw == 0xFFFF:
+        temperature = -999.0
     else:
-        # Mirrors repo logic: sign bit handling as implemented there.
-        temp_positive = -1 if (temperature_raw & 0x8000) == 0 else 1
-        temperature = (temperature_raw & 0x7FFF) * 0.01 * temp_positive
+        temp_positive = -1 if (temp_raw & 0x8000) == 0 else 1
+        temperature = (temp_raw & 0x7FFF) * 0.01 * temp_positive
 
     humidity_raw = bytes_to_short(block, 10)
-    humidity = -999 if humidity_raw == 0xFFFF else humidity_raw * 0.01
+    humidity = -999.0 if humidity_raw == 0xFFFF else humidity_raw * 0.01
 
-    return {
-        "sensor_mac": mac,
-        "temperature_c": round(temperature, 2),
-        "humidity_pct": round(humidity, 2) if humidity != -999 else -999,
-        "battery_pct": battery,
-        "voltage_v": round(voltage, 2) if voltage != -999 else -999,
-    }
+    reading = TempReading(
+        sensor_mac=mac,
+        temperature_c=round(temperature, 2),
+        humidity_pct=round(humidity, 2) if humidity != -999.0 else -999.0,
+        battery_pct=battery,
+        voltage_v=round(voltage, 2) if voltage != -999.0 else -999.0,
+    )
 
-
-def extract_candidate_blocks(manufacturer_data: dict[int, bytes]):
-    """Collect candidate 15-byte blocks from advertisement manufacturer data."""
-    blocks = []
-    for _, payload in manufacturer_data.items():
-        if not payload:
-            continue
-
-        # Some frames pack BLE data with leading type bytes; scan payload for 15-byte chunks.
-        for i in range(0, max(0, len(payload) - 14)):
-            chunk = payload[i : i + 15]
-            decoded = decode_ble_temp_block(chunk)
-            if decoded is not None:
-                blocks.append(decoded)
-    return blocks
+    # Guard rails: filter obvious false-positive parses.
+    if not plausible(reading):
+        return None
+    return reading
 
 
-async def main():
+def plausible(r: TempReading) -> bool:
+    if r.temperature_c != -999.0 and not (-60.0 <= r.temperature_c <= 125.0):
+        return False
+    if r.humidity_pct != -999.0 and not (0.0 <= r.humidity_pct <= 100.0):
+        return False
+    if r.battery_pct != -999 and not (0 <= r.battery_pct <= 100):
+        return False
+    if r.voltage_v != -999.0 and not (1.5 <= r.voltage_v <= 4.5):
+        return False
+    return True
+
+
+def parse_topflytech_temp_payload(payload: bytes) -> Iterable[TempReading]:
+    # Expected pattern from repo for temp-only BLE packets: 00 04 + 15-byte blocks.
+    if len(payload) < 2 or payload[0] != 0x00 or payload[1] != 0x04:
+        return []
+
+    out: list[TempReading] = []
+    i = 2
+    while i + 15 <= len(payload):
+        reading = decode_temp_block(payload[i : i + 15])
+        if reading is not None:
+            out.append(reading)
+        i += 15
+    return out
+
+
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Read nearby TOPFLYtech BLE temperature")
-    parser.add_argument("--name", help="Filter by device name substring (e.g. T-Sense)")
-    parser.add_argument("--mac", help="Filter by BLE MAC address")
-    parser.add_argument("--timeout", type=float, default=0.0, help="Run seconds (0=forever)")
+    parser.add_argument("--name", help="Filter by BLE local-name substring (example: T-Sense)")
+    parser.add_argument("--mac", help="Filter by advertiser MAC address")
+    parser.add_argument("--timeout", type=float, default=0.0, help="Run seconds; 0 = forever")
     args = parser.parse_args()
 
     target_mac = args.mac.upper() if args.mac else None
     name_filter = args.name.lower() if args.name else None
 
+    last_by_sensor: dict[str, TempReading] = {}
     print("Scanning BLE advertisements... Ctrl+C to stop")
 
-    def detection_callback(device, advertisement_data):
+    def callback(device, adv):
         if target_mac and device.address.upper() != target_mac:
             return
         if name_filter:
-            name = (device.name or advertisement_data.local_name or "").lower()
+            name = (device.name or adv.local_name or "").lower()
             if name_filter not in name:
                 return
 
-        blocks = extract_candidate_blocks(advertisement_data.manufacturer_data)
-        for d in blocks:
-            now = datetime.now(timezone.utc).isoformat()
-            print(
-                f"[{now}] dev={device.address} sensor={d['sensor_mac']} "
-                f"temp={d['temperature_c']}°C hum={d['humidity_pct']}% "
-                f"bat={d['battery_pct']}% volt={d['voltage_v']}V"
-            )
+        for payload in adv.manufacturer_data.values():
+            for reading in parse_topflytech_temp_payload(payload):
+                if last_by_sensor.get(reading.sensor_mac) == reading:
+                    continue
+                last_by_sensor[reading.sensor_mac] = reading
+                now = datetime.now(timezone.utc).isoformat()
+                print(
+                    f"[{now}] dev={device.address} sensor={reading.sensor_mac} "
+                    f"temp={reading.temperature_c}°C hum={reading.humidity_pct}% "
+                    f"bat={reading.battery_pct}% volt={reading.voltage_v}V"
+                )
 
-    scanner = BleakScanner(detection_callback)
+    scanner = BleakScanner(callback)
     await scanner.start()
     try:
         if args.timeout > 0:
