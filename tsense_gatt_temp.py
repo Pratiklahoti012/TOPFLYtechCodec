@@ -47,6 +47,7 @@ async def main():
     ap.add_argument("--char", default=DEFAULT_DATA_CHAR, help="Notify/write characteristic UUID")
     ap.add_argument("--scan-timeout", type=float, default=20.0)
     ap.add_argument("--settle", type=float, default=5.0, help="seconds to wait for auto push")
+    ap.add_argument("--send-commands", action="store_true", help="send probe commands to the characteristic")
     args = ap.parse_args()
 
     print(f"Scanning for {args.mac} ...")
@@ -60,24 +61,34 @@ async def main():
         b = bytes(data)
         print(f"notify {sender}: {b.hex()} ({list(b)})")
         if b == b"\x04\x00\x02":
-            print("  -> device returned 04 00 02 (command rejected/unsupported in current state)")
+            print("  -> device returned 04 00 02 (command rejected/unsupported).")
+            print("     This usually means this characteristic is notify-only or requires a login/session command first.")
         readings = parse_temp_payload(b)
         for mac, t, h, bat, volt in readings:
             print(f"  -> sensor={mac} temp={t}C hum={h}% bat={bat}% volt={volt}V")
 
     async with BleakClient(dev, timeout=20.0) as c:
-        print("Connected. Subscribing...")
+        print("Connected. Service/characteristic summary:")
+        for svc in c.services:
+            for ch in svc.characteristics:
+                props = ",".join(ch.properties)
+                print(f"  - {ch.uuid} props=[{props}]")
+
+        print("Subscribing...")
         await c.start_notify(args.char, on_notify)
         print(f"Waiting {args.settle}s for auto-push...")
         await asyncio.sleep(args.settle)
 
-        for cmd in cmds:
-            print(f"write {cmd.hex()}")
-            try:
-                await c.write_gatt_char(args.char, cmd, response=True)
-            except Exception:
-                await c.write_gatt_char(args.char, cmd, response=False)
-            await asyncio.sleep(2)
+        if args.send_commands:
+            for cmd in cmds:
+                print(f"write {cmd.hex()}")
+                try:
+                    await c.write_gatt_char(args.char, cmd, response=True)
+                except Exception:
+                    await c.write_gatt_char(args.char, cmd, response=False)
+                await asyncio.sleep(2)
+        else:
+            print("Skipping writes (default). Use --send-commands if you want to probe command support.")
 
         print("Listening 10s for late packets...")
         await asyncio.sleep(10)
